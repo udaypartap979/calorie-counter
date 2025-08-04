@@ -1,10 +1,12 @@
 require("dotenv").config();
 const express = require("express");
+const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const { GoogleGenerativeAI } = require("@google/generative-ai"); // Import Gemini
 
 const app = express();
+app.use(cors());
 const port = process.env.PORT || 3000;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
