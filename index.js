@@ -5,10 +5,14 @@ const multer = require("multer");
 const axios = require("axios");
 const { GoogleGenerativeAI } = require("@google/generative-ai"); // Import Gemini
 
+//import supabase client
+const supabase = require('./supabaseClient');
+
 // test comment 
 // test commit ishwar_test_branch
 const app = express();
 app.use(cors());
+app.use(express.json());
 const port = process.env.PORT || 3000;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -218,8 +222,6 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
       return res.status(400).json({ error: "No image file provided." });
     }
 
-    console.log("Step 1: Identifying food items with Gemini 1.5 Pro...");
-
     const prompt = `
       Analyze this image and identify all distinct, edible food items and drinks.
       - For composite dishes (like 'Chicken and Waffles'), identify the main dish name.
@@ -267,7 +269,9 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
     );
 
     const totalCalories = foodsWithNutrition.reduce((sum, food) => sum + (Number(food.calories) || 0), 0);
-    
+    console.log("Total calories:", totalCalories);
+    console.log("Foods with nutrition:", foodsWithNutrition);
+
     res.status(200).json({
       identifiedFoods: foodsWithNutrition,
       totalEstimatedCalories: totalCalories,
@@ -277,6 +281,82 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
   } catch (error) {
     console.error("ERROR during image analysis:", error);
     res.status(500).json({ error: "Failed to analyze image." });
+  }
+});
+
+app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
+  console.log('✅ /log-meal endpoint hit');
+  try {
+    // We expect userId and userEmail from the frontend
+    const { userId, userEmail, analysisResult } = req.body;
+    
+    if (!req.file || !userId || !analysisResult) {
+      return res.status(400).json({ error: 'Image, User ID, and analysis result are required.' });
+    }
+
+    // 1. Upload the image to Storage
+    const fileName = `${Date.now()}-${req.file.originalname}`;
+    await supabase.storage
+        .from('meal-images')
+        .upload(fileName, req.file.buffer, { contentType: req.file.mimetype });
+
+    const { data: urlData } = supabase.storage
+        .from('meal-images')
+        .getPublicUrl(fileName);
+    const imageUrl = urlData.publicUrl;
+    
+    // 2. Parse the analysis result
+    const parsedAnalysis = JSON.parse(analysisResult);
+    const { identifiedFoods, totalEstimatedCalories } = parsedAnalysis;
+    
+    // 3. Perform a simple insert into the single 'meals' table
+    const { data, error } = await supabase
+      .from('meals')
+      .insert([{
+        user_id: userId,
+        user_email: userEmail, // Store the email
+        image_url: imageUrl,
+        total_calories: totalEstimatedCalories,
+        meal_items: identifiedFoods // Store the array of food details
+      }]);
+
+    if (error) {
+        console.error('Supabase insert error:', error);
+        throw error;
+    }
+
+    console.log('Meal logged successfully for user:', userId);
+    res.status(201).json({ message: 'Meal logged successfully!', data });
+
+  } catch (error) {
+    console.error('Error in /log-meal endpoint:', error);
+    res.status(500).json({ error: 'Failed to log meal.' });
+  }
+});
+
+
+// --- UPDATED: The /meals endpoint now does a simple select ---
+app.get('/meals', async (req, res) => {
+  console.log('✅ /meals endpoint hit');
+  try {
+    const { userId } = req.query;
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required.' });
+    }
+
+    // Simple select query on the single 'meals' table
+    const { data, error } = await supabase
+      .from('meals')
+      .select('*') // Select all columns
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error('Error fetching meals:', error);
+    res.status(500).json({ error: 'Failed to fetch meals.' });
   }
 });
 
