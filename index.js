@@ -243,13 +243,11 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
 
     const identifiedFoods = geminiResponseText.split(',').map(item => item.trim()).filter(item => item);
 
-    console.log("Analysis complete (Gemini 1.5 Pro):", identifiedFoods);
     
     if (identifiedFoods.length === 0) {
         return res.status(404).json({ error: "No food items could be identified." });
     }
     
-    console.log(`Step 2: Fetching nutrition for: ${identifiedFoods.join(', ')}`);
     const foodsWithNutrition = await Promise.all(
       identifiedFoods.map(async (food) => {
         let nutritionInfo = await getFoodInfoSpoonacular(food) || await getQuickNutritionGuess(food);
@@ -269,8 +267,6 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
     );
 
     const totalCalories = foodsWithNutrition.reduce((sum, food) => sum + (Number(food.calories) || 0), 0);
-    console.log("Total calories:", totalCalories);
-    console.log("Foods with nutrition:", foodsWithNutrition);
 
     res.status(200).json({
       identifiedFoods: foodsWithNutrition,
@@ -285,7 +281,6 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
 });
 
 app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
-  console.log('✅ /log-meal endpoint hit');
   try {
     // We expect userId and userEmail from the frontend
     const { userId, userEmail, analysisResult } = req.body;
@@ -325,7 +320,6 @@ app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
         throw error;
     }
 
-    console.log('Meal logged successfully for user:', userId);
     res.status(201).json({ message: 'Meal logged successfully!', data });
 
   } catch (error) {
@@ -337,7 +331,6 @@ app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
 
 // --- UPDATED: The /meals endpoint now does a simple select ---
 app.get('/meals', async (req, res) => {
-  console.log('✅ /meals endpoint hit');
   try {
     const { userId } = req.query;
     if (!userId) {
