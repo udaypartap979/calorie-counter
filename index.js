@@ -3,21 +3,19 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
-const { GoogleGenerativeAI } = require("@google/generative-ai"); // Import Gemini
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-//import supabase client
 const supabase = require('./supabaseClient');
 
-// test comment 
-// test commit ishwar_test_branch
 const app = express();
 app.use(cors());
 app.use(express.json());
 const port = process.env.PORT || 3000;
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
 
+// Generic multer instance
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -309,10 +307,11 @@ app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
       .from('meals')
       .insert([{
         user_id: userId,
-        user_email: userEmail, // Store the email
-        image_url: imageUrl,
-        total_calories: totalEstimatedCalories,
-        meal_items: identifiedFoods // Store the array of food details
+              user_email: userEmail,
+              image_url: imageUrl,
+              total_calories: totalEstimatedCalories,
+              item_type: 'food', // This is always 'food' for this endpoint
+              log_details: identifiedFoods
       }]);
 
     if (error) {
@@ -328,6 +327,72 @@ app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
   }
 });
 
+app.post('/log-audio', upload.single('foodAudio'), async (req, res) => {
+  try {
+      const { userId, userEmail } = req.body;
+      const audioFile = req.file;
+
+      if (!audioFile || !userId) {
+          return res.status(400).json({ error: 'Audio file and User ID are required.' });
+      }
+
+      // 1. Classify audio as 'food' or 'workout'
+      const audioPart = { inlineData: { data: audioFile.buffer.toString("base64"), mimeType: audioFile.mimetype } };
+      const classificationPrompt = `Does this audio describe eating food, nutrition, or calories, OR does it describe physical exercise like running, lifting weights, or a workout? Respond with only the word "food" or "workout".`;
+      const classificationResult = await geminiModel.generateContent([classificationPrompt, audioPart]);
+      const itemType = classificationResult.response.text().trim().toLowerCase();
+      
+      // 2. Transcribe the audio
+      const transcribeResult = await geminiModel.generateContent(["Transcribe this audio.", audioPart]);
+      const transcript = transcribeResult.response.text();
+
+      let logDetails = {};
+      let totalCalories = 0;
+
+      // 3. Process based on classification
+      if (itemType === 'workout') {
+          // --- NEW: Gemini calorie estimation for workouts ---
+
+          // 1. Create a new prompt asking for a calorie estimate
+          const caloriePrompt = `Based on the following workout transcript, provide a rough estimate of the total calories burned. Respond with only a single number. For example: 350. Transcript: "${transcript}"`;
+          
+          // 2. Call Gemini with the new prompt
+          const calorieResult = await geminiModel.generateContent(caloriePrompt);
+          const estimatedCalories = parseInt(calorieResult.response.text().trim()) || 0;
+          
+
+          // 3. Update the variables to be saved
+          totalCalories = estimatedCalories; // This will now be saved to the database
+          logDetails = { 
+              transcript: transcript,
+              estimated_calories_burned: estimatedCalories // Also save it in the details
+          };} else { // It's food
+          const foodPrompt = `From the following text, extract food items and their portion sizes. Respond with a comma-separated list. Text: "${transcript}"`;
+          const foodResult = await geminiModel.generateContent(foodPrompt);
+          const foodListFromAudio = foodResult.response.text().split(',').map(item => item.trim()).filter(Boolean);
+          const foodsWithNutrition = await Promise.all(foodListFromAudio.map(food => getFoodInfoSpoonacular(food).then(info => info || { name: food, calories: 0 })));
+          
+          logDetails = foodsWithNutrition;
+          totalCalories = foodsWithNutrition.reduce((sum, food) => sum + (Number(food.calories) || 0), 0);
+      }
+
+      // 4. Insert into the database
+      const { error } = await supabase.from('meals').insert([{
+          user_id: userId,
+          user_email: userEmail,
+          item_type: itemType,
+          total_calories: totalCalories,
+          log_details: logDetails
+      }]);
+
+      if (error) throw error;
+      res.status(201).json({ message: `${itemType} logged successfully!` });
+
+  } catch (error) {
+      console.error('Error in /log-audio endpoint:', error);
+      res.status(500).json({ error: 'Failed to log audio.' });
+  }
+});
 
 // --- UPDATED: The /meals endpoint now does a simple select ---
 app.get('/meals', async (req, res) => {
