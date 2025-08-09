@@ -328,7 +328,6 @@ app.post('/log-meal', upload.single('foodImage'), async (req, res) => {
 });
 
 app.post('/log-audio', upload.single('foodAudio'), async (req, res) => {
-  console.log('✅ /log-audio endpoint hit');
   try {
       const { userId, userEmail } = req.body;
       const audioFile = req.file;
@@ -353,7 +352,6 @@ app.post('/log-audio', upload.single('foodAudio'), async (req, res) => {
       // 3. Process based on classification
       if (itemType === 'workout') {
           // --- NEW: Gemini calorie estimation for workouts ---
-          console.log("Estimating calories burned for workout...");
 
           // 1. Create a new prompt asking for a calorie estimate
           const caloriePrompt = `Based on the following workout transcript, provide a rough estimate of the total calories burned. Respond with only a single number. For example: 350. Transcript: "${transcript}"`;
@@ -362,7 +360,6 @@ app.post('/log-audio', upload.single('foodAudio'), async (req, res) => {
           const calorieResult = await geminiModel.generateContent(caloriePrompt);
           const estimatedCalories = parseInt(calorieResult.response.text().trim()) || 0;
           
-          console.log(`Estimated calories burned: ${estimatedCalories}`);
 
           // 3. Update the variables to be saved
           totalCalories = estimatedCalories; // This will now be saved to the database
