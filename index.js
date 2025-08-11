@@ -234,13 +234,13 @@ app.post("/identify-food", upload.single("foodImage"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ error: "No image file provided." });
     }
-    const prompt = ` 
-Analyze this image and identify all distinct, edible food items and drinks. 
-- For composite dishes (like 'Chicken and Waffles'), identify the main dish name. 
-- For separate items (like drinks or side sauces), list them individually. 
-- Exclude all non-edible items like plates, cutlery, tablecloths, or people. 
-- Return the list as a simple comma-separated string. 
-- Example output: Fried Chicken, Waffle, Syrup, Butter 
+    const prompt = ` 
+Analyze this image and identify all distinct, edible food items and drinks. 
+- For composite dishes (like 'Chicken and Waffles'), identify the main dish name. 
+- For separate items (like drinks or side sauces), list them individually. 
+- Exclude all non-edible items like plates, cutlery, tablecloths, or people. 
+- Return the list as a simple comma-separated string. 
+- Example output: Fried Chicken, Waffle, Syrup, Butter 
 `;
     const imagePart = {
       inlineData: {
@@ -443,40 +443,26 @@ app.get("/meals", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch meals." });
   }
 });
-// Remove the duplicate endpoint at the end of your file and replace with this updated version:
-
 app.post("/invite-dashboard-access", async (req, res) => {
-  const { recipientEmail, userId } = req.body; // Get userId from request body (sent by frontend)
-  
+  const { recipientEmail } = req.body;
   if (!recipientEmail) {
     return res.status(400).json({ error: "Recipient email is required." });
   }
-  
-  if (!userId) {
-    return res.status(400).json({ error: "User authentication required." });
-  }
-
-  // Generate the proper dashboard URL with userId
-  const dashboardUrl = `https://calorie-counter-three-gamma.vercel.app/dashboard?userId=${userId}`;
-
   const mailOptions = {
     to: recipientEmail,
     subject: "You've been invited to view a dashboard!",
-    html: `
+    html: ` 
 <p>Hello,</p> 
 <p>A friend has invited you to view their personal dashboard.</p> 
-<p>You can see all their latest activity by visiting this link: <a href="${dashboardUrl}">View Dashboard</a></p> 
+<p>You can see all their latest activity by visiting this link: <a href="https://your-dashboard-url.com">Your Dashboard Link</a></p> 
 <p>Best regards,</p> 
 <p>The Dashboard Team</p> 
 `,
   };
-
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Invitation email sent successfully to ${recipientEmail} for userId: ${userId}`);
-    res.status(200).json({ 
-      message: "Invitation email sent successfully.",
-    });
+    console.log(`Invitation email sent successfully to ${recipientEmail}`);
+    res.status(200).json({ message: "Invitation email sent successfully." });
   } catch (error) {
     console.error("Error sending email:", error);
     res.status(500).json({ error: "Failed to send invitation email." });
@@ -497,11 +483,11 @@ app.post("/invite-dashboard-access", async (req, res) => {
     to: recipientEmail,
     subject: "You've been invited to view a dashboard!",
     html: `
-<p>Hello,</p> 
-<p>A friend has invited you to view their personal dashboard.</p> 
-<p>You can see all their latest activity by visiting this link: <a href="https://your-dashboard-url.com">Your Dashboard Link</a></p> 
-<p>Best regards,</p> 
-<p>The Dashboard Team</p> 
+<p>Hello,</p> 
+<p>A friend has invited you to view their personal dashboard.</p> 
+<p>You can see all their latest activity by visiting this link: <a href="https://your-dashboard-url.com">Your Dashboard Link</a></p> 
+<p>Best regards,</p> 
+<p>The Dashboard Team</p> 
 `,
   };
   try {
