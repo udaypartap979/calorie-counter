@@ -15,9 +15,11 @@
     "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.54.0",
     "axios": "^1.11.0",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
+    "express-session": "^1.18.2",
     "form-data": "^4.0.4",
     "multer": "^2.0.2"
   }
