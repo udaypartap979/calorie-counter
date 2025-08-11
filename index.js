@@ -455,7 +455,7 @@ app.post("/invite-dashboard-access", async (req, res) => {
   }
 
   // Generate the proper dashboard URL with userId
-  const dashboardUrl = `https://calorie-counter-three-gamma.vercel.app/dashboard?userId=${userId}`;
+  const dashboardUrl = `https://calorie-frontend.vercel.app/dashboard?userId=${userId}`;
 
   const mailOptions = {
     to: recipientEmail,
