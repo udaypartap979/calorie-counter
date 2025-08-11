@@ -474,26 +474,40 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   console.log(`✅ Server is running on http://localhost:${port}`);
 });
+
 app.post("/invite-dashboard-access", async (req, res) => {
-  const { recipientEmail } = req.body;
+  const { recipientEmail, userId } = req.body; // Add userId to destructuring
+  
   if (!recipientEmail) {
     return res.status(400).json({ error: "Recipient email is required." });
   }
+  
+  if (!userId) {
+    return res.status(400).json({ error: "User ID is required." });
+  }
+
+  // Generate the proper dashboard URL with userId
+  const dashboardUrl = `https://calorie-counter-three-gamma.vercel.app/meals?userId=${userId}`;
+
   const mailOptions = {
     to: recipientEmail,
     subject: "You've been invited to view a dashboard!",
     html: `
 <p>Hello,</p> 
 <p>A friend has invited you to view their personal dashboard.</p> 
-<p>You can see all their latest activity by visiting this link: <a href="https://your-dashboard-url.com">Your Dashboard Link</a></p> 
+<p>You can see all their latest activity by visiting this link: <a href="${dashboardUrl}">View Dashboard</a></p> 
 <p>Best regards,</p> 
 <p>The Dashboard Team</p> 
 `,
   };
+
   try {
     await transporter.sendMail(mailOptions);
-    console.log(`Invitation email sent successfully to ${recipientEmail}`);
-    res.status(200).json({ message: "Invitation email sent successfully." });
+    console.log(`Invitation email sent successfully to ${recipientEmail} for userId: ${userId}`);
+    res.status(200).json({ 
+      message: "Invitation email sent successfully.",
+      dashboardUrl: dashboardUrl // Optional: return the URL for confirmation
+    });
   } catch (error) {
     console.error("Error sending email:", error);
     res.status(500).json({ error: "Failed to send invitation email." });
