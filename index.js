@@ -480,6 +480,7 @@ app.post("/invite-dashboard-access", async (req, res) => {
     console.error("Error sending email:", error);
     res.status(500).json({ error: "Failed to send invitation email." });
   }
+  
 });
 app.get("/", (req, res) => {
   res.status(200).json({ status: "healthy", message: "Service is running" });
