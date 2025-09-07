@@ -55,7 +55,6 @@ const multerLib = require("multer");
 const uploadNone = multerLib().none(); // use this for parsing Exotel callback form-data fields
 
 
-console.log("META_PAGE_ACCESS_TOKEN length:", (process.env.META_PAGE_ACCESS_TOKEN || "").length);
 
 
 
@@ -97,23 +96,24 @@ const APPLE_WATCH_ADJUST = Number(process.env.APPLE_WATCH_ADJUST || 1.0);
 
 // ------ FOOD PARSER (text) ------
 const SYS_FOOD_TEXT = `
-You are a nutrition facts engine.
-
-Priority order for nutrition sources:
-1. Brand label / official restaurant menu (if available).
-2. Restaurant menu approximations (if user mentions a venue like "Oberoi Mumbai" or "Punjab Grill"). 
-   - Use estimates from known restaurant dishes or close analogs.
-   - Clearly state assumptions (portion, restaurant estimate).
-   - Confidence ≤0.6 unless official numbers are found.
-3. Trusted DBs (USDA, IFCT, Nutritionix, Open Food Facts).
+You are a nutrition facts engine. Extract foods and nutrition ONLY from trusted sources:
+- Brand label
+- Open Food Facts (packaged foods)
+- IFCT (India)
+- USDA FDC
+- Nutritionix
 
 STRICT RULES:
-- Never return 0 calories if the item is clearly edible. Always provide best-effort estimates with assumptions.
-- Use "source": "venue_menu:<venue>" when you are giving a venue-based approximation.
-- Always include "assumptions" array at item level and totals.
+- For each food item, ALWAYS include an "assumptions" array at the item level.
+  Examples:
+  ["assumed medium chapati = 40 g", "assumed 1 katori dal = 200 ml"]
+- Assumptions must describe how you inferred portion sizes, serving sizes, or database choices.
+- If no assumption is needed (exact DB match with explicit portion), still return ["exact match from USDA"].
+- Totals must also include an "assumptions" array summarizing overall reasoning.
+- Never invent values; if uncertain, return 0 calories, confidence 0, source "unknown".
+- Confidence = 1.0 for exact DB match, ≤0.8 for inferred portions.
 - Output strict JSON only.
 `;
-
 
 
 const USER_FOOD_TEXT = (content) => `
@@ -152,27 +152,19 @@ TEXT:
 
 
 // ------ IMAGE FOOD PARSER ------
-
 const SYS_FOOD_IMAGE = `
-You are a vision nutrition parser.
-
-Priority order for nutrition sources:
-1. Brand label / official restaurant menu (if visible or mentioned in caption).
-2. Restaurant menu approximations (if caption includes a venue like "Oberoi Mumbai" or "Punjab Grill").
-   - Use estimates from known restaurant dishes or close analogs.
-   - Clearly state assumptions (portion size, restaurant approximation).
-   - Confidence ≤0.6 unless official numbers are found.
-3. Trusted DBs (USDA, IFCT, Nutritionix, Open Food Facts).
+You are a vision nutrition parser. Use Brand labels, Open Food Facts, IFCT, USDA, or Nutritionix.
 
 STRICT RULES:
-- Never return 0 calories if the image clearly shows edible food.
+- Only include visible portion (plate, bowl, serving), not entire dish.
 - For each food item, ALWAYS include an "assumptions" array at the item level.
-- Totals must also include an "assumptions" array.
-- Use "source": "venue_menu:<venue>" if the nutrition is an approximation from a restaurant.
+  Examples:
+  ["assumed 1 plate rice ≈ 150 g", "assumed small bowl of dal ≈ 200 ml"]
+- If a label is visible, assumptions = ["nutrition taken directly from label"].
+- Totals must also include an "assumptions" array summarizing overall reasoning.
+- Confidence = 1.0 if label or DB exact match, ≤0.8 if portion inferred.
 - Output strict JSON only.
 `;
-
-
 
 
 
@@ -259,23 +251,21 @@ Tasks:
 }
 
 // ------ UNIVERSAL CLASSIFIERS (food vs workout) ------
-// modify signature and use caption
-async function classifyFoodOrWorkoutFromImage(imageBase64, mimeType, captionText = "") {
+async function classifyFoodOrWorkoutFromText(text) {
   try {
-    const messages = [
-      { role: "system", content: "Look at the image and caption and return only one word: 'food' or 'workout'." },
-      { role: "user", content: [
-          { type: "text", text: captionText ? `User caption (authoritative):\n"""${captionText}"""` : "No caption provided." },
-          { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }
-      ] }
-    ];
-    const r = await openai.chat.completions.create({ model: OPENAI_MODEL_VISION, temperature: 0.0, messages });
+    const r = await openai.chat.completions.create({
+      model: OPENAI_MODEL_TEXT,
+      temperature: 0,
+      messages: [
+        { role: "system", content: "Classify the input as 'food' or 'workout'. Return only one word." },
+        { role: "user", content: `INPUT:\n"""${text}"""` }
+      ]
+    });
     return (r.choices?.[0]?.message?.content || "food").trim().toLowerCase().includes("workout") ? "workout" : "food";
   } catch {
     return "food";
   }
 }
-
 
 async function classifyFoodOrWorkoutFromImage(imageBase64, mimeType) {
   try {
@@ -352,7 +342,7 @@ async function preprocessAudio(rawPath, cleanedPath) {
     return rawPath;
   }
 }
-/*
+
 // -- Whisper transcription (uses env prompts) --
 async function transcribeAudioWithWhisper(audioBuffer) {
   const stamp = Date.now();
@@ -393,48 +383,6 @@ const cleanedPath = `/tmp/${stamp}-cleaned.wav`; // safe, linear PCM for Whisper
     }
   }
 }
-*/
-// Deterministic transcription: convert to 16k mono PCM WAV then call Whisper with language hint.
-// -- Whisper transcription (with preprocessing re-enabled) --
-async function transcribeAudioWithWhisper(audioBuffer) {
-  const stamp = Date.now();
-  const rawPath = `/tmp/${stamp}-raw.audio`;     // original format
-  const cleanedPath = `/tmp/${stamp}-cleaned.wav`; // preprocessed PCM wav
-
-  fs.writeFileSync(rawPath, audioBuffer);
-
-  let stream = null;
-  try {
-    // Preprocess (rnnoise + silence removal + loudnorm if rnnoise model available)
-    const pathForWhisper = await preprocessAudio(rawPath, cleanedPath);
-
-    if (!fs.existsSync(pathForWhisper)) {
-      throw new Error(`Audio file missing before Whisper: ${pathForWhisper}`);
-    }
-
-    stream = fs.createReadStream(pathForWhisper);
-
-    const resp = await openai.audio.transcriptions.create({
-      file: stream,
-      model: "whisper-1",
-      prompt: WHISPER_CONTEXT_PROMPT || "",
-      language: "en"
-      // language: "en",   // uncomment if you want to force English only
-    });
-
-    console.log("[Whisper] transcription OK:", resp?.text?.slice(0, 200));
-    return resp.text ?? "";
-  } catch (err) {
-    console.error("Error transcribing with Whisper (preprocess path):", err);
-    throw new Error("Failed to transcribe audio.");
-  } finally {
-    try { if (stream) stream.close(); } catch {}
-    for (const p of [rawPath, cleanedPath]) {
-      try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
-    }
-  }
-}
-
 
 // -- Text analyzer (food/workout) --
 async function analyzeContentWithChatGPT(content) {
@@ -488,16 +436,19 @@ async function analyzeContentWithChatGPT(content) {
 
   return out;
 }
+
+// -- Audio analyzer (transcribe -> detect both food + workout) --
 async function analyzeAudioWithGPT(audioBuffer) {
   const transcript = await transcribeAudioWithWhisper(audioBuffer);
   console.log("[Audio->Transcript]", transcript);
 
+  // 🟢 New: Ask GPT to split into BOTH food + workout
   const prompt = `
 Transcript: """${transcript}"""
 
 Task:
-- Extract food mentions (items, portions, nutrition) using the food parser schema.
-- Extract workout mentions (activities, durations, calories burned) using the workout parser schema.
+- Extract food mentions (items, portions, nutrition) using same schema as your food parser.
+- Extract workout mentions (activities, durations, calories burned) using same schema as your workout parser.
 - If one is missing, return it as empty.
 
 Return strict JSON:
@@ -516,22 +467,16 @@ Return strict JSON:
 }
 `;
 
-  // Primary call: ask for strict JSON
   const resp = await openai.chat.completions.create({
     model: OPENAI_MODEL_TEXT,
     temperature: 0.2,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: "You are a strict JSON generator for food/workout logs." },
-      { role: "user", content: prompt }
-    ]
+    messages: [{ role: "system", content: prompt }]
   });
 
   let out = {};
   try {
-    out = JSON.parse(resp.choices?.[0]?.message?.content || "{}");
-  } catch (err) {
-    console.error("[analyzeAudioWithGPT] JSON parse failed:", err);
+    out = JSON.parse(resp.choices[0].message.content || "{}");
+  } catch {
     out = {
       food: { type: "food", details: [], totals: { calories: 0, assumptions: ["parse failed"], confidence: 0 } },
       workout: { type: "workout", details: [], totals: { calories_burned: 0, assumptions: ["parse failed"], confidence: 0 } },
@@ -539,223 +484,9 @@ Return strict JSON:
     };
   }
 
-  // Defensive normalization
-  out.food = out.food || { type: "food", details: [], totals: { calories: 0, assumptions: [], confidence: 0 } };
-  out.workout = out.workout || { type: "workout", details: [], totals: { calories_burned: 0, assumptions: [], confidence: 0 } };
-
-  // Defensive normalization for workout calories (if details include calories_burned)
-  try {
-    if (out.workout && Array.isArray(out.workout.details)) {
-      const workoutTotal = out.workout.details.reduce(
-        (s, d) => s + (num(d?.calories_burned, 0) || 0),
-        0
-      );
-
-      if (workoutTotal > 0 && (!out.workout.totals || !out.workout.totals.calories_burned)) {
-        out.workout.totals = out.workout.totals || {};
-        out.workout.totals.calories_burned = workoutTotal;
-        out.workout.totals.assumptions = Array.isArray(out.workout.totals.assumptions)
-          ? out.workout.totals.assumptions.concat(["calculated from details"])
-          : ["calculated from details"];
-        out.workout.totals.confidence = out.workout.totals.confidence ?? 0.7;
-        console.log(`[analyzeAudioWithGPT] recomputed workout calories=${workoutTotal}`);
-      }
-    }
-  } catch (err) {
-    console.error("[analyzeAudioWithGPT] workout normalization error:", err);
-  }
-
-
-
-  // If food items exist but calories total is zero, attempt targeted re-query per-item
-  try {
-    const details = Array.isArray(out.food.details) ? out.food.details : [];
-    const totalCalories = details.reduce((s, d) => s + (num(d?.calories, 0) || 0), 0);
-
-    if (details.length > 0 && totalCalories === 0) {
-      console.log("[analyzeAudioWithGPT] Detected food items but calories == 0, attempting per-item nutrition lookup...");
-
-      const enrichedDetails = [];
-
-      for (const item of details) {
-        const itemName = (item && item.item) ? String(item.item).trim() : "";
-        if (!itemName) {
-          enrichedDetails.push(item);
-          continue;
-        }
-
-        // Prompt GPT specifically to extract nutrition for this single item using the strict food parser schema
-        try {
-          const foodResp = await openai.chat.completions.create({
-            model: OPENAI_MODEL_TEXT,
-            temperature: 0.2,
-            response_format: { type: "json_object" },
-            messages: [
-              { role: "system", content: SYS_FOOD_TEXT },
-              { role: "user", content: USER_FOOD_TEXT(itemName) }
-            ],
-          });
-
-          let parsed = {};
-          try {
-            parsed = JSON.parse(foodResp.choices?.[0]?.message?.content || "{}");
-          } catch (parseErr) {
-            parsed = null;
-          }
-
-          if (parsed && parsed.type === "food" && Array.isArray(parsed.details) && parsed.details.length > 0) {
-            // Prefer first detail returned for this item
-            const pd = parsed.details[0];
-            enrichedDetails.push({
-              item: pd?.item ?? itemName,
-              quantity: Number(pd?.quantity ?? item?.quantity ?? 0) || 0,
-              unit: pd?.unit ?? item?.unit ?? "",
-              calories: Number(pd?.calories ?? item?.calories ?? 0) || 0,
-              macros: {
-                protein: Number(pd?.macros?.protein ?? item?.macros?.protein ?? 0) || 0,
-                fat:     Number(pd?.macros?.fat ?? item?.macros?.fat ?? 0) || 0,
-                carbs:   Number(pd?.macros?.carbs ?? item?.macros?.carbs ?? 0) || 0,
-              },
-              brand: pd?.brand ?? item?.brand ?? "",
-              source: pd?.source ?? item?.source ?? "",
-              confidence: Math.max(0, Math.min(1, Number(pd?.confidence ?? item?.confidence ?? 0))) || 0,
-              assumptions: Array.isArray(pd?.assumptions) ? pd.assumptions : (item?.assumptions || [])
-            });
-            continue;
-          }
-
-          // fallback: return original item unchanged if parser didn't help
-          enrichedDetails.push(item);
-        } catch (innerErr) {
-          console.warn("[analyzeAudioWithGPT] per-item nutrition lookup failed for:", itemName, innerErr && (innerErr.message || innerErr));
-          enrichedDetails.push(item);
-        }
-      } // end for
-
-      // Replace details with enriched version and recompute totals
-      out.food.details = enrichedDetails;
-      const newTotal = enrichedDetails.reduce((s, d) => s + (num(d?.calories, 0) || 0), 0);
-
-      out.food.totals = out.food.totals || {};
-      out.food.totals.calories = newTotal;
-      // keep assumptions array, but add a note that we enriched via per-item lookup
-      out.food.totals.assumptions = Array.isArray(out.food.totals.assumptions) ? out.food.totals.assumptions.concat(["per-item nutrition lookup attempted"]) : ["per-item nutrition lookup attempted"];
-      out.food.totals.confidence = out.food.totals.confidence ?? null;
-      console.log(`[analyzeAudioWithGPT] per-item enrichment complete. new total calories=${newTotal}`);
-    }
-  } catch (enrichErr) {
-    console.error("[analyzeAudioWithGPT] Error during per-item enrichment:", enrichErr);
-    // don't fail the whole pipeline for enrichment errors
-  }
-
-  // --- Workout enrichment: if workout details exist but totals are zero, call workout estimator ---
-  try {
-    const wDetails = Array.isArray(out.workout.details) ? out.workout.details : [];
-    const wTotalsVal = num(out.workout.totals?.calories_burned ?? 0, 0);
-
-    if (wDetails.length > 0 && wTotalsVal === 0) {
-      console.log("[analyzeAudioWithGPT] workout details present but calories_burned==0, calling workout estimator...");
-
-      const wResp = await openai.chat.completions.create({
-        model: OPENAI_MODEL_TEXT,
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYS_WORKOUT_ESTIMATOR },
-          { role: "user", content: buildWorkoutUserPrompt({ modality: "text", text: transcript }) }
-        ]
-      });
-
-      let wOut = {};
-      try { wOut = JSON.parse(wResp.choices?.[0]?.message?.content || "{}"); } catch (e) { wOut = null; }
-
-      if (wOut && wOut.type === "workout") {
-        // Normalize details returned by GPT (ensure numeric duration_min and calories_burned)
-        if (Array.isArray(wOut.details) && wOut.details.length) {
-          out.workout.details = wOut.details.map(d => ({
-            activity: (d?.activity || d?.name || "workout").toString(),
-            duration_min: Number(d?.duration_min ?? d?.duration ?? 0) || 0,
-            calories_burned: Number(d?.calories_burned ?? d?.calories ?? 0) || 0,
-            intensity: d?.intensity || "unknown",
-            assumptions: Array.isArray(d?.assumptions) ? d.assumptions : (d?.assumptions ? [d.assumptions] : []),
-            confidence: (typeof d?.confidence === "number") ? d.confidence : (d?.confidence ? Number(d.confidence) : null)
-          }));
-        }
-
-        // Ensure totals object exists and use GPT totals if provided (coerce to number)
-        out.workout.totals = out.workout.totals || {};
-        out.workout.totals.calories_burned = Number(wOut.totals?.calories_burned ?? out.workout.totals.calories_burned ?? 0) || 0;
-        out.workout.totals.assumptions = Array.isArray(out.workout.totals.assumptions)
-          ? out.workout.totals.assumptions.concat(wOut.totals?.assumptions || [])
-          : (wOut.totals?.assumptions || []);
-        out.workout.totals.confidence = out.workout.totals.confidence ?? (wOut.totals?.confidence ?? null);
-
-        // If durations are all zero, attempt lightweight extraction from the transcript:
-        try {
-          const details = Array.isArray(out.workout.details) ? out.workout.details : [];
-          const totalDur = details.reduce((s, d) => s + (Number(d.duration_min) || 0), 0);
-
-          if (details.length && totalDur === 0 && typeof transcript === "string" && transcript.trim().length) {
-            console.log("[analyzeAudioWithGPT] workout durations all zero — attempting to parse durations from transcript");
-
-            // Extract numeric duration tokens (minutes/hours). This finds numbers like "30 min", "30 minutes", "1.5 hr", "1 hour"
-            const minuteRegex = /(\d+(?:[\.,]\d+)?)\s*(?:m(?:in(?:utes?)?)?\.?)/gi;
-            const hourRegex   = /(\d+(?:[\.,]\d+)?)\s*(?:h(?:our|rs?)?\.?)/gi;
-
-            const foundDurations = [];
-
-            let m;
-            while ((m = minuteRegex.exec(transcript)) !== null) {
-              const num = Number(String(m[1]).replace(",", "."));
-              if (Number.isFinite(num)) foundDurations.push(Math.round(num)); // already minutes
-            }
-            while ((m = hourRegex.exec(transcript)) !== null) {
-              const num = Number(String(m[1]).replace(",", "."));
-              if (Number.isFinite(num)) foundDurations.push(Math.round(num * 60)); // convert hours -> minutes
-            }
-
-            // If nothing matched the strict patterns, also try looser "(\d+) ?mins" style matching
-            if (!foundDurations.length) {
-              const looser = /(\d{1,3})\s*(?:mins?|minutes?|m)/gi;
-              while ((m = looser.exec(transcript)) !== null) {
-                const num = Number(m[1]);
-                if (Number.isFinite(num)) foundDurations.push(num);
-              }
-            }
-
-            // If we found durations, assign them to workout details in order.
-            if (foundDurations.length) {
-              console.log("[analyzeAudioWithGPT] parsed durations (mins):", foundDurations);
-              for (let i = 0; i < details.length; i++) {
-                // round-robin or sequential assignment: prefer same-index duration, otherwise reuse last found
-                const dur = foundDurations[i] ?? foundDurations[foundDurations.length - 1];
-                details[i].duration_min = Number(dur) || details[i].duration_min || 0;
-              }
-              // Recalculate totals.calories_burned from detail-level calories if present (sum), else keep existing totals
-              const sumCaloriesFromDetails = details.reduce((s, d) => s + (Number(d.calories_burned) || 0), 0);
-              if (sumCaloriesFromDetails > 0) {
-                out.workout.totals.calories_burned = Math.round(sumCaloriesFromDetails);
-              }
-              out.workout.details = details;
-            } else {
-              console.log("[analyzeAudioWithGPT] no durations parsed from transcript");
-            }
-          }
-        } catch (durErr) {
-          console.warn("[analyzeAudioWithGPT] duration extraction failed:", durErr && (durErr.message || durErr));
-        }
-
-        console.log("[analyzeAudioWithGPT] workout estimator provided calories_burned =", out.workout.totals.calories_burned, "details:", out.workout.details);
-      }
-    }
-  } catch (err) {
-    console.error("[analyzeAudioWithGPT] workout estimator error:", err);
-  }
-
   console.log("[Analysis] food items:", out.food?.details?.length, "workout items:", out.workout?.details?.length);
   return out;
 }
-
 
 
 // -- Image analyzer (vision path; also supports workout machines) --
@@ -822,6 +553,20 @@ async function analyzeImageWithChatGPT(imageBuffer, mimeType) {
   }));
 
   return out;
+}
+
+// -- Twilio media downloader (auth to Twilio CDN) --
+async function downloadTwilioMedia(mediaUrl) {
+  const response = await axios({
+    method: "get",
+    url: mediaUrl,
+    responseType: "arraybuffer",
+    auth: {
+      username: process.env.TWILIO_ACCOUNT_SID,
+      password: process.env.TWILIO_AUTH_TOKEN,
+    },
+  });
+  return Buffer.from(response.data);
 }
 
 // -- Craving coach text (WhatsApp-friendly formatting) --
@@ -993,447 +738,196 @@ app.get("/whatsapp-webhook", (req, res) => {
   }
 });
 
-// --- Meta-style webhook that mirrors your Twilio logic ---
-// Requirements: process.env.META_PAGE_ACCESS_TOKEN, process.env.WHATSAPP_PHONE_NUMBER_ID
-const FormDataNode = require("form-data");
-// --- Paste near top of file ---
-function prettyAxiosError(err) {
+/**
+ * Flow: WhatsApp user message -> Twilio -> /whatsapp-webhook
+ * Routes to image/audio/text analyzers, logs, then replies.
+ */
+app.post("/whatsapp-webhook", async (req, res) => {
+  const incomingMsg = req.body;
+  const userPhoneNumber = incomingMsg.From;
+  let responseMessage = "Processing your request...";
+
+  // 1) Immediate ack to the user (so WhatsApp shows quick feedback)
+  await twilioClient.messages.create({
+    from: incomingMsg.To,
+    to: userPhoneNumber,
+    body: responseMessage,
+  });
+
+  // 2) Acknowledge Twilio's webhook
+  res.status(200).send();
+
+  // ---------- local helpers used only within this route ----------
+  const logAnalysis = async ({ analysis, mediaBuffer, contentType }) => {
+    const logFormData = new FormData();
+
+if (mediaBuffer) {
+  logFormData.append("image", mediaBuffer, {
+    filename: "log-image.jpg",
+    contentType: contentType || "image/jpeg",
+  });
+}
+
+logFormData.append("userId", userPhoneNumber);
+logFormData.append("userEmail", "xyz@gmail.com");
+logFormData.append("analysisResult", JSON.stringify(analysis));
+
+await axios.post(`${BASE_URL}/log-analysis`, logFormData, {
+  headers: logFormData.getHeaders(),
+});
+  };
+
   try {
-    if (!err) return String(err);
-    if (err.response && err.response.data) {
-      let d = err.response.data;
-      // If it's an ArrayBuffer / Buffer -> string
-      if (Buffer.isBuffer(d) || d instanceof ArrayBuffer) {
-        try { d = Buffer.from(d).toString("utf8"); } catch {}
-      } else if (typeof d === "object") {
-        try { d = JSON.stringify(d, null, 2); } catch {}
+    // ---------- (A) MEDIA MESSAGE ----------
+    if (incomingMsg.MediaContentType0 && incomingMsg.MediaUrl0) {
+      const mediaUrl = incomingMsg.MediaUrl0;
+      const contentType = incomingMsg.MediaContentType0 || "";
+      const mediaBuffer = await downloadTwilioMedia(mediaUrl);
+
+      let analysis = null;
+
+      if (contentType.includes("image")) {
+        const formData = new FormData();
+        formData.append("image", mediaBuffer, { filename: "whatsapp-image.jpg", contentType });
+
+        if (incomingMsg.Body) {
+          formData.append("text", incomingMsg.Body); // attach caption text
+        }
+
+        const { data } = await axios.post(`${BASE_URL}/analyze-image-with-text`, formData, {
+          headers: formData.getHeaders(),
+        });
+
+        analysis = data;
+
+        await logAnalysis({ analysis, mediaBuffer, contentType });
+
+      } else if (contentType.includes("audio")) {
+        analysis = await processAndLogAudio(
+          mediaBuffer,
+          userPhoneNumber,
+          contentType,
+          "whatsapp-audio"
+        );
+        
+      } else {
+        responseMessage = "Food/Workout: Unsupported media type. Please send an image or audio.";
+        await twilioClient.messages.create({
+          from: incomingMsg.To,
+          to: userPhoneNumber,
+          body: responseMessage,
+        });
+        return;
       }
-      return `HTTP ${err.response.status}: ${d}`;
+
+      // 3) Final reply
+      responseMessage = buildReplyForAnalysis(analysis);
+      console.log("[WhatsApp Reply] ->", responseMessage);
+
     }
-    if (err.request) {
-      return `No response received. Request: ${err.request && err.request.path ? err.request.path : JSON.stringify(err.request)}`;
+
+    // ---------- (B) TEXT MESSAGE ----------
+    else if (incomingMsg.Body) {
+      const userText = incomingMsg.Body;
+      const lowerCaseText = userText.toLowerCase();
+    
+      if (lowerCaseText.includes("crave") || lowerCaseText.includes("craving")) {
+        // existing craving logic
+        const { data } = await axios.post(`${BASE_URL}/handle-craving`, { text: userText });
+        responseMessage = data.advice;
+    
+      } else if (
+        lowerCaseText.includes("what should i eat") || 
+        lowerCaseText.includes("diet suggestion") ||
+        lowerCaseText.includes("recommend food")
+      ) {
+        // 👇 new diet recommendation logic
+        const { data } = await axios.post(`${BASE_URL}/recommend-food`, {
+          userId: userPhoneNumber // or however you store user ID
+        });
+        responseMessage = data.recommendations;
+    
+      } 
+      else if (lowerCaseText.includes("analyze")) {
+        const { data } = await axios.post(`${BASE_URL}/analyze-summary`, {
+          userId: userPhoneNumber,
+        });
+      
+        await twilioClient.messages.create({
+          from: incomingMsg.To,
+          to: userPhoneNumber,
+          body: "📊 Here’s your Calories Summary",
+          mediaUrl: [data.caloriesChartUrl],
+        });
+      
+        await twilioClient.messages.create({
+          from: incomingMsg.To,
+          to: userPhoneNumber,
+          body: "📊 Here’s your Macros Summary",
+          mediaUrl: [data.macrosChartUrl],
+        });
+      
+        return; // stop further processing
+      }     
+      else {
+        // default food/workout analyzer
+        const { data: analysis } = await axios.post(`${BASE_URL}/analyze-text`, { text: userText });
+        await logAnalysis({ analysis });
+        responseMessage = buildReplyForAnalysis(analysis);
+      }
     }
-    return `Error: ${err.message || String(err)}`;
+    
+
+  } catch (error) {
+    console.error("Error processing WhatsApp message:", error);
+    responseMessage = "Food/Workout: Sorry, I couldn't process that. Please try again.";
+  }
+
+  // 3) Send the final, detailed response
+  //console.log("[WHATSAPP] incoming audio:", { contentType: mediaContentType, bytes: mediaBuffer.length });
+
+  const quoted = incomingMsg.Body || (incomingMsg.MediaContentType0 ? "[image/audio]" : "");
+const finalReply = quoted
+  ? `*You said:* \n> ${quoted}\n\n${responseMessage}`
+  : responseMessage;
+
+await twilioClient.messages.create({
+  from: incomingMsg.To,
+  to: userPhoneNumber,
+  body: finalReply,
+});
+  /*await twilioClient.messages.create({
+    from: incomingMsg.To,
+    to: userPhoneNumber,
+    body: responseMessage,
+    context: {
+      message_id: incomingMsg.SmsMessageSid  // 👈 this makes WhatsApp render inline quote
+    }
+  });*/
+});
+
+// ---------- ANALYZE AUDIO ----------
+app.post("/analyze-audio", upload.single("audio"), async (req, res) => {
+  try {
+    let audioBuffer;
+
+    if (req.file) {
+      audioBuffer = req.file.buffer;
+    } else if (req.body.url) {
+      const audioRes = await fetch(req.body.url);
+      audioBuffer = await audioRes.buffer();
+    } else {
+      return res.status(400).json({ error: "No audio provided." });
+    }
+
+    const analysis = await analyzeAudioWithGPT(audioBuffer);
+
+    return res.status(200).json(analysis);
   } catch (e) {
-    return `Error pretty-printing axios error: ${String(e)}`;
+    console.error("Error in /analyze-audio:", e);
+    return res.status(500).json({ error: "Failed to analyze audio." });
   }
-}
-
-// --- safer meta send that prints readable errors ---
-async function metaSendText(toWaId, text, contextMessageId = null) {
-  const token = process.env.META_PAGE_ACCESS_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const graphVersion = process.env.META_GRAPH_VERSION || "v17.0";
-  const payload = {
-    messaging_product: "whatsapp",
-    to: toWaId,
-    type: "text",
-    text: { body: text },
-  };
-  if (contextMessageId) payload.context = { message_id: contextMessageId };
-
-  try {
-    await axios.post(
-      `https://graph.facebook.com/${graphVersion}/${phoneNumberId}/messages`,
-      payload,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-  } catch (err) {
-    console.error("[metaSendText] send error:", prettyAxiosError(err));
-    throw err;
-  }
-}
-
-// send an image message (by URL) via Meta/WhatsApp
-async function metaSendImageUrl(toWaId, imageUrl, caption = "", contextMessageId = null) {
-  const token = process.env.META_PAGE_ACCESS_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const graphVersion = process.env.META_GRAPH_VERSION || "v17.0";
-
-  const payload = {
-    messaging_product: "whatsapp",
-    to: toWaId,
-    type: "image",
-    image: {
-      link: imageUrl,
-      caption: caption || undefined
-    }
-  };
-  if (contextMessageId) payload.context = { message_id: contextMessageId };
-
-  try {
-    await axios.post(
-      `https://graph.facebook.com/${graphVersion}/${phoneNumberId}/messages`,
-      payload,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-  } catch (err) {
-    console.error("[metaSendImageUrl] send error:", prettyAxiosError(err));
-    throw err;
-  }
-}
-
-async function fetchMetaMediaBytes(mediaId, opts = {}) {
-  // opts: { maxRetries: number, retryDelayMs: number }
-  const token = process.env.META_PAGE_ACCESS_TOKEN;
-  const graphVersion = process.env.META_GRAPH_VERSION || "v17.0";
-  const maxRetries = (opts.maxRetries != null) ? opts.maxRetries : 3;
-  const baseDelay = (opts.retryDelayMs != null) ? opts.retryDelayMs : 300; // ms
-
-  // 1) Fetch media object (gives temporary url)
-  let metaResp;
-  try {
-    metaResp = await axios.get(
-      `https://graph.facebook.com/${graphVersion}/${mediaId}`,
-      { params: { fields: "url,mime_type", access_token: token }, timeout: 10_000 }
-    );
-  } catch (err) {
-    console.error("[fetchMetaMediaBytes] error fetching media object:", prettyAxiosError(err));
-    throw err;
-  }
-
-  const { url, mime_type } = metaResp.data || {};
-  if (!url) throw new Error("Media object returned no 'url' field.");
-
-  // Helper to try downloading (with optional auth header)
-  async function tryDownload(downloadUrl, useAuth = false) {
-    const headers = {};
-    if (useAuth) headers.Authorization = `Bearer ${token}`;
-    const resp = await axios.get(downloadUrl, { responseType: "arraybuffer", headers, timeout: 20000, validateStatus: s => true });
-    return resp;
-  }
-
-  // 2) Try without auth first, then with auth if needed
-  let attempt = 0;
-  let lastError = null;
-  while (attempt <= maxRetries) {
-    const useAuth = attempt > 0; // 0 -> no auth, 1+ -> with auth (and exponential backoff)
-    try {
-      const resp = await tryDownload(url, useAuth);
-      // Accept 200 as success; treat 2xx as success
-      if (resp.status >= 200 && resp.status < 300) {
-        return { buffer: Buffer.from(resp.data), mimeType: mime_type || "application/octet-stream" };
-      }
-      // If 401 and we didn't use auth yet, we'll retry with auth on next loop
-      lastError = { status: resp.status, data: resp.data };
-      const bodyPreview = Buffer.isBuffer(resp.data) ? resp.data.toString("utf8").slice(0, 300) : String(resp.data).slice(0,300);
-      console.warn(`[fetchMetaMediaBytes] download attempt ${attempt} status=${resp.status} useAuth=${useAuth} body=${bodyPreview}`);
-      // if status is 401 and we haven't tried auth, next attempt will set useAuth=true
-    } catch (err) {
-      lastError = err;
-      console.warn(`[fetchMetaMediaBytes] download attempt ${attempt} failed: ${prettyAxiosError(err)}`);
-    }
-
-    // exponential backoff
-    attempt++;
-    const delay = baseDelay * Math.pow(2, attempt);
-    await new Promise((r) => setTimeout(r, delay));
-  }
-
-  // all retries failed
-  console.error("[fetchMetaMediaBytes] all download attempts failed. Last error:", lastError && (lastError.message || JSON.stringify(lastError)).slice ? (lastError.message || JSON.stringify(lastError)) : String(lastError));
-  throw new Error("Failed to download media after retries.");
-}
-
-
-
-// local helper: logAnalysis (calls your existing /log-analysis endpoint)
-async function logAnalysisMeta({ analysis, mediaBuffer, contentType, userPhoneNumber }) {
-  try {
-    const form = new FormDataNode();
-    if (mediaBuffer) {
-      // attempt to pick a sensible filename
-      const ext = (contentType || "").includes("audio") ? ".ogg" : ".jpg";
-      form.append("image", mediaBuffer, { filename: `log-media${ext}`, contentType: contentType || "application/octet-stream" });
-    }
-    form.append("userId", userPhoneNumber);
-    form.append("userEmail", `${userPhoneNumber}@wa`); // or set to your user mapping
-    form.append("analysisResult", JSON.stringify(analysis));
-    await axios.post(`${BASE_URL}/log-analysis`, form, { headers: form.getHeaders() });
-  } catch (err) {
-    console.warn("logAnalysisMeta failed:", err?.response?.data || err.message);
-  }
-}
-// ---------- Meta-style webhook (robust, keeps your original audio flow + improvements) ----------
-app.post(
-  "/whatsapp-webhook",
-  express.json({ verify: (req, res, buf) => { req.rawBody = buf && buf.toString ? buf.toString() : null; } }),
-  async (req, res) => {
-    try {
-      console.log("[INCOMING WEBHOOK BODY]", JSON.stringify(req.body || {}, null, 2));
-      const incoming = req.body;
-      if (!incoming || !incoming.entry) {
-        console.log("[WH] no entry -> 200");
-        return res.sendStatus(200);
-      }
-
-      // collect tasks
-      const tasks = [];
-      for (const entry of incoming.entry) {
-        const changes = entry.changes || [];
-        for (const change of changes) {
-          const val = change.value || {};
-          const messages = val.messages || [];
-          for (const message of messages) {
-            // debug
-            console.log("----- [WH MSG DEBUG] BEGIN -----");
-            console.log("[WH MSG] keys:", Object.keys(message || {}));
-            try { console.log("[WH MSG] preview:", JSON.stringify(message, null, 2).slice(0, 4000)); } catch (e) {}
-            console.log("[WH MSG] hasImage:", !!message?.image, "hasVideo:", !!message?.video, "hasDocument:", !!message?.document, "hasAudio:", !!message?.audio);
-            console.log("----- [WH MSG DEBUG] END -----");
-
-            const from = message.from;
-            const msgId = message.id;
-            tasks.push({ from, msgId, message, metadata: val.metadata || {} });
-          }
-        }
-      }
-
-      if (!tasks.length) {
-        console.log("[WH] no tasks -> 200");
-        return res.sendStatus(200);
-      }
-
-      // Quick ack to each sender (de-duplicated)
-      const ackText = "Processing your request...";
-      const acked = new Set();
-      for (const t of tasks) {
-        try {
-          if (t.from && !acked.has(t.from)) {
-            await metaSendText(t.from, ackText, t.msgId).catch(err => console.warn("[WH] ack send failed:", err && err.message ? err.message : err));
-            acked.add(t.from);
-          }
-        } catch (e) {}
-      }
-
-      // respond to webhook quickly (Meta expects a fast response)
-      res.status(200).send();
-
-      // Process tasks sequentially (same-process)
-      for (const t of tasks) {
-        const { from, msgId, message } = t;
-        try {
-          // robust caption extraction
-          const captionCandidates = [
-            message?.text?.body,
-            message?.caption,
-            message?.image?.caption,
-            message?.image?.caption?.text,
-            message?.context?.quoted_message?.text
-          ];
-          let captionText = "";
-          for (const p of captionCandidates) {
-            if (p && typeof p === "string" && p.trim().length) {
-              captionText = p.trim();
-              break;
-            }
-          }
-          if (captionText) {
-            captionText = captionText.replace(/\r?\n+/g, " ").trim();
-            if (captionText.length > 800) captionText = captionText.slice(0, 800) + "...";
-          }
-
-          // handle media messages
-          if (message.image || message.video || message.document || message.audio) {
-            const mediaObj = message.image || message.video || message.document || message.audio;
-            const mediaId = mediaObj?.id;
-            if (!mediaId) {
-              await metaSendText(from, "Sorry, couldn't find media to download. Please resend.", msgId);
-              continue;
-            }
-
-            // download media (handles auth / retries)
-            let mediaBuffer, contentType;
-            try {
-              const fetched = await fetchMetaMediaBytes(mediaId);
-              mediaBuffer = fetched.buffer;
-              contentType = fetched.mimeType || fetched.mime_type || (mediaObj?.mime_type || "");
-            } catch (err) {
-              console.error("[whatsapp-webhook] failed to download media:", prettyAxiosError(err));
-              await metaSendText(from, "Sorry, I couldn't download that media. Please try sending it again.", msgId);
-              continue;
-            }
-
-            // IMAGE handling
-            if ((contentType || "").startsWith("image/") || message.image) {
-              try {
-                // If you want to call your internal merged analyzer directly instead of HTTP,
-                // you can call analyzeImageWithChatGPT(mediaBuffer, contentType, captionText)
-                // But to preserve the existing flow that merges caption-first + vision, call /analyze-image-with-text as before:
-                const form = new FormDataNode();
-                const filename = "whatsapp-image.jpg";
-                form.append("image", mediaBuffer, { filename, contentType: contentType || "image/jpeg" });
-                if (captionText) form.append("text", captionText);
-
-                const safeCaptionForUrl = captionText ? `?text=${encodeURIComponent(captionText)}` : "";
-                const analyzeUrl = `${BASE_URL}/analyze-image-with-text${safeCaptionForUrl}`;
-                console.log("[WH -> ANALYZE] calling analyze endpoint:", analyzeUrl);
-                console.log("[WH -> ANALYZE] form headers preview:", form.getHeaders()['content-type'] ? form.getHeaders()['content-type'].slice(0,200) : "<no content-type>");
-
-                const { data } = await axios.post(analyzeUrl, form, { headers: form.getHeaders(), timeout: 60000 });
-                const analysis = data;
-                // log & send reply
-                await logAnalysisMeta({ analysis, mediaBuffer, contentType, userPhoneNumber: from }).catch(e => console.warn("[WH] logAnalysisMeta failed:", e && e.message));
-                const reply = buildReplyForAnalysis(analysis);
-                await metaSendText(from, reply, msgId);
-              } catch (err) {
-                console.error("[WH -> ANALYZE] analyze call failed:", prettyAxiosError(err));
-                await metaSendText(from, "Sorry — failed to analyze the image. Try again.", msgId);
-              }
-              continue;
-            }
-
-            // AUDIO handling (voice note)
-            if ((contentType || "").startsWith("audio/") || (contentType || "").includes("ogg") || mediaObj?.voice) {
-              try {
-                console.log("[whatsapp-webhook][audio] processing audio for", from);
-                // debug write
-                const stamp = Date.now();
-                const ext = (contentType || "").includes("ogg") ? ".ogg" : (contentType || "").includes("mpeg") || (contentType || "").includes("mp3") ? ".mp3" : ".audio";
-                const debugPath = `/tmp/wa-voice-${stamp}${ext}`;
-                try { fs.writeFileSync(debugPath, mediaBuffer); console.log("[whatsapp-webhook][audio] saved debug file:", debugPath, "bytes:", mediaBuffer.length); } catch (e) { console.warn("[whatsapp-webhook][audio] failed to write debug file:", e && e.message); }
-
-                // Quick ffmpeg check (useful if your preprocess uses ffmpeg)
-                try {
-                  const { stdout } = await execPromise("ffmpeg -version").catch(() => ({ stdout: "" }));
-                  if (!stdout) console.warn("[whatsapp-webhook][audio] ffmpeg not found; ensure ffmpeg installed for preprocessing/transcription.");
-                  else console.log("[whatsapp-webhook][audio] ffmpeg available.");
-                } catch (e) { console.warn("[whatsapp-webhook][audio] ffmpeg check error:", e && e.message); }
-
-                // 1) Primary: in-process analyze (transcribe -> analyze)
-                let combinedAnalysis = null;
-                try {
-                  combinedAnalysis = await analyzeAudioWithGPT(mediaBuffer);
-                  console.log("[whatsapp-webhook][audio] analyzeAudioWithGPT succeeded");
-                } catch (errPrimary) {
-                  console.error("[whatsapp-webhook][audio] analyzeAudioWithGPT failed:", prettyAxiosError(errPrimary));
-                }
-
-                // 2) Fallback: processAndLogAudio (multipart POST to /analyze-audio + /log-analysis)
-                if (!combinedAnalysis) {
-                  try {
-                    console.log("[whatsapp-webhook][audio] attempting fallback processAndLogAudio...");
-                    combinedAnalysis = await processAndLogAudio(mediaBuffer, from, contentType || "audio/ogg", "whatsapp-audio");
-                    console.log("[whatsapp-webhook][audio] processAndLogAudio succeeded");
-                  } catch (errFallback) {
-                    console.error("[whatsapp-webhook][audio] processAndLogAudio failed:", prettyAxiosError(errFallback));
-                  }
-                }
-
-                // 3) If both failed
-                if (!combinedAnalysis) {
-                  console.error("[whatsapp-webhook][audio] both primary and fallback analyzers failed. Debug file:", debugPath);
-                  await metaSendText(from, `Sorry — I couldn't process your voice note right now. I've saved the file for debugging: ${debugPath}\nPlease try a short (3–8s) voice note or send the text.`, msgId);
-                  continue;
-                }
-
-                // 4) Build reply
-                let reply = "";
-                // If analyzer returned the { food, workout, transcript } shape (analyzeAudioWithGPT)
-                if (combinedAnalysis && (combinedAnalysis.food || combinedAnalysis.workout)) {
-                  const hasFood = combinedAnalysis.food && Array.isArray(combinedAnalysis.food.details) && combinedAnalysis.food.details.length;
-                  const hasWorkout = combinedAnalysis.workout && Array.isArray(combinedAnalysis.workout.details) && combinedAnalysis.workout.details.length;
-
-                  if (hasFood && !hasWorkout) {
-                    reply = buildReplyForAnalysis(combinedAnalysis.food);
-                  } else if (hasWorkout && !hasFood) {
-                    reply = buildReplyForAnalysis(combinedAnalysis.workout);
-                  } else if (hasFood && hasWorkout) {
-                    const f = buildReplyForAnalysis(combinedAnalysis.food);
-                    const w = buildReplyForAnalysis(combinedAnalysis.workout);
-                    reply = `${f}\n\n${w}`;
-                  } else {
-                    const tr = combinedAnalysis.transcript ? `Transcript: "${String(combinedAnalysis.transcript).slice(0,240)}"` : "";
-                    reply = `Sorry, I couldn't confidently extract food or workout from the voice note. ${tr}\nTry a short 3–8s voice note or type it.`;
-                  }
-                }
-                // If fallback returned analysis shaped like your /analyze-audio or /analyze-image result
-                else if (combinedAnalysis && combinedAnalysis.type) {
-                  reply = buildReplyForAnalysis(combinedAnalysis);
-                } else {
-                  reply = "Sorry — analysis returned an unexpected format. Try text or a short voice note.";
-                }
-
-                // 5) Ensure logged (if fallback hasn't already logged)
-                try { await logAnalysisMeta({ analysis: combinedAnalysis, mediaBuffer, contentType, userPhoneNumber: from }); } catch (e) { console.warn("[whatsapp-webhook][audio] logAnalysisMeta non-fatal error:", e && e.message); }
-
-                // 6) send reply
-                await metaSendText(from, reply, msgId);
-              } catch (audioErr) {
-                console.error("[whatsapp-webhook][audio] unexpected error:", audioErr && (audioErr.stack || audioErr.message || audioErr));
-                try { await metaSendText(from, "Sorry — couldn't process your voice note right now. Try sending a short one or text.", msgId); } catch {}
-              }
-              continue;
-            }
-
-            // If media type not recognized:
-            await metaSendText(from, "Sorry, I can process photos and voice notes only. Please send a photo or a short voice note.", msgId);
-            continue;
-          } // end media handling
-
-          // handle text messages
-          else if (message.text && message.text.body) {
-            const userText = message.text.body;
-            try {
-              const lower = userText.toLowerCase();
-              if (lower.includes("crave") || lower.includes("craving")) {
-                const { data } = await axios.post(`${BASE_URL}/handle-craving`, { text: userText, userId: from });
-                await metaSendText(from, data.advice, msgId);
-              } else if (lower.includes("what should i eat") || lower.includes("diet suggestion") || lower.includes("recommend food")) {
-                const { data } = await axios.post(`${BASE_URL}/recommend-food`, { userId: from });
-                await metaSendText(from, data.recommendations, msgId);
-              } else if (lower.includes("analyze") || lower.includes("summary")) {
-                const { data } = await axios.post(`${BASE_URL}/analyze-summary`, { userId: from });
-                try {
-                  await metaSendImageUrl(from, data.caloriesChartUrl, "📊 Here’s your Calories Summary", msgId);
-                  await metaSendImageUrl(from, data.macrosChartUrl, "📊 Here’s your Macros Summary", msgId);
-                } catch (sendErr) {
-                  console.warn("Failed to send chart images:", sendErr?.response?.data || sendErr?.message || sendErr);
-                  await metaSendText(from, `Charts:\n${data.caloriesChartUrl}\n${data.macrosChartUrl}`, msgId);
-                }
-              } else {
-                // default: analyze text (food/workout)
-                try {
-                  const { data: analysis } = await axios.post(`${BASE_URL}/analyze-text`, { text: userText });
-                  await logAnalysisMeta({ analysis, mediaBuffer: null, contentType: null, userPhoneNumber: from });
-                  const reply = buildReplyForAnalysis(analysis);
-                  await metaSendText(from, reply, msgId);
-                } catch (err) {
-                  console.error("[whatsapp-webhook][text] error:", prettyAxiosError(err));
-                  await metaSendText(from, "Sorry — couldn't analyze that text right now.", msgId);
-                }
-              }
-            } catch (err) {
-              console.error("[whatsapp-webhook][text] unexpected error:", err && (err.stack || err.message || err));
-              try { await metaSendText(from, "Sorry — couldn't process that message.", msgId); } catch {}
-            }
-          } // interactive (buttons/lists)
-          else if (message.interactive) {
-            const title = message.interactive.button_reply?.title || message.interactive.list_reply?.title || "";
-            if (title) {
-              const { data: analysis } = await axios.post(`${BASE_URL}/analyze-text`, { text: title });
-              await logAnalysisMeta({ analysis, mediaBuffer: null, contentType: null, userPhoneNumber: from });
-              const reply = buildReplyForAnalysis(analysis);
-              await metaSendText(from, reply, msgId);
-            } else {
-              await metaSendText(from, "Thanks — I received your selection.", msgId);
-            }
-          } else {
-            await metaSendText(from, "Sorry, I can process text, photos and voice notes. Please send one of those.", msgId);
-          }
-        } catch (procErr) {
-          console.error("Error processing Meta WhatsApp message:", prettyAxiosError(procErr));
-          try { await metaSendText(t.from, "Food/Workout: Sorry, I couldn't process that. Please try again.", t.msgId); } catch {}
-        }
-      } // end tasks loop
-    } catch (outerErr) {
-      console.error("[whatsapp-webhook] outer handler error:", prettyAxiosError(outerErr));
-      try { res.status(500).send(); } catch {}
-    }
-  }
-);
-
-
+});
 
 
 // ---------- ANALYZE TEXT ----------
@@ -1451,34 +945,6 @@ app.post("/analyze-text", async (req, res) => {
   }
 });
 
-// Add this near your other classifier helpers (e.g. under classifyFoodOrWorkoutFromImage)
-async function classifyFoodOrWorkoutFromText(text) {
-  try {
-    // Defensive: coerce to string
-    const input = (text || "").toString().trim();
-    if (!input) return "food";
-
-    const resp = await openai.chat.completions.create({
-      model: OPENAI_MODEL_TEXT,
-      temperature: 0.0,
-      messages: [
-        { role: "system", content: "Classify the input as exactly one word: 'food' or 'workout'. Return only that word." },
-        { role: "user", content: `INPUT:\n"""${input}"""` }
-      ],
-      // you can keep response_format off here since we only need plain text
-    });
-
-    const content = String(resp?.choices?.[0]?.message?.content || "").toLowerCase();
-    if (content.includes("workout")) return "workout";
-    return "food";
-  } catch (err) {
-    console.warn("[classifyFoodOrWorkoutFromText] error:", err && (err.message || err));
-    // safe default: treat as food so text food flows still work
-    return "food";
-  }
-}
-
-
 // ---------- ANALYZE IMAGE ----------
 app.post("/analyze-image", upload.single("image"), async (req, res) => {
   try {
@@ -1492,255 +958,188 @@ app.post("/analyze-image", upload.single("image"), async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-// ---------- ANALYZE IMAGE + TEXT (merge caption-only items + vision-detected items) ----------
+
+// ---------- ANALYZE IMAGE + TEXT ----------
 app.post("/analyze-image-with-text", upload.single("image"), async (req, res) => {
   try {
-    // Basic request debug
-    console.log("[/analyze-image-with-text] content-type:", req.headers['content-type']);
-    console.log("[/analyze-image-with-text] req.body keys:", Object.keys(req.body || {}));
-    console.log("[/analyze-image-with-text] req.query keys:", Object.keys(req.query || {}));
-    console.log("[/analyze-image-with-text] req.file present:", !!req.file);
-    if (req.file) console.log("[/analyze-image-with-text] file:", { name: req.file.originalname, mimetype: req.file.mimetype, size: req.file.size });
-
-    // 1) Collect caption (body multipart or query fallback)
-    const captionFromBody = req.body && req.body.text ? String(req.body.text).trim() : "";
-    const captionFromQuery = req.query && req.query.text ? String(req.query.text).trim() : "";
-    const caption = captionFromBody || captionFromQuery || "";
-
-    console.log("[/analyze-image-with-text] caption present?:", !!caption);
-    if (caption) console.log("[/analyze-image-with-text] caption preview:", caption.slice(0,400));
-
-    // Helper: safe JSON parse
-    const safeParse = (s) => { try { return JSON.parse(s || "{}"); } catch (e) { return null; } };
-
-    // Storage for parsed outputs
-    let captionParsed = null; // result from text parser (food/workout schema)
-    let visionParsed = null;  // result from vision model
-
-    // 2) If caption exists: parse it strictly (food/workout). We will use these items as authoritative for names present.
-    if (caption) {
-      try {
-        // 2a: classify caption as food or workout
-        let cls = "food";
-        try {
-          const clsResp = await openai.chat.completions.create({
-            model: OPENAI_MODEL_TEXT,
-            temperature: 0.0,
-            messages: [
-              { role: "system", content: "Classify the input as 'food' or 'workout'. Return only one word." },
-              { role: "user", content: `INPUT:\n"""${caption}"""` }
-            ]
-          });
-          const clsText = String(clsResp.choices?.[0]?.message?.content || "").toLowerCase();
-          cls = clsText.includes("workout") ? "workout" : "food";
-        } catch (e) {
-          console.warn("[/analyze-image-with-text] caption classification failed, defaulting to food:", e && e.message);
-          cls = "food";
-        }
-
-        if (cls === "workout") {
-          // Call workout estimator
-          const wResp = await openai.chat.completions.create({
-            model: OPENAI_MODEL_TEXT,
-            temperature: 0.1,
-            messages: [
-              { role: "system", content: SYS_WORKOUT_ESTIMATOR },
-              { role: "user", content: buildWorkoutUserPrompt({ modality: "text", text: caption }) }
-            ]
-          });
-
-          const wOut = safeParse(wResp.choices?.[0]?.message?.content) || null;
-          if (wOut && wOut.type === "workout") captionParsed = wOut;
-        } else {
-          // Call strict food parser
-          const fResp = await openai.chat.completions.create({
-            model: OPENAI_MODEL_TEXT,
-            temperature: 0.0,
-            messages: [
-              { role: "system", content: SYS_FOOD_TEXT },
-              { role: "user", content: USER_FOOD_TEXT(caption) }
-            ]
-          });
-
-          const fOut = safeParse(fResp.choices?.[0]?.message?.content) || null;
-          if (fOut && fOut.type === "food") {
-            // annotate items as user_caption and bump confidence
-            if (Array.isArray(fOut.details)) {
-              fOut.details = fOut.details.map(d => ({
-                item: d?.item ?? "",
-                quantity: Number(d?.quantity ?? 0) || 0,
-                unit: d?.unit ?? "",
-                calories: Number(d?.calories ?? 0) || 0,
-                macros: {
-                  protein: Number(d?.macros?.protein ?? 0) || 0,
-                  fat: Number(d?.macros?.fat ?? 0) || 0,
-                  carbs: Number(d?.macros?.carbs ?? 0) || 0
-                },
-                brand: d?.brand ?? "",
-                source: "user_caption",
-                confidence: Math.max(0.9, Number(d?.confidence ?? 0.9)),
-                assumptions: Array.isArray(d?.assumptions) ? d.assumptions : (d?.assumptions ? [String(d.assumptions)] : ["parsed from caption"])
-              }));
-            }
-            fOut.totals = fOut.totals || {};
-            fOut.totals.calories = Number(fOut.totals?.calories ?? fOut.details.reduce((s, it) => s + num(it.calories, 0), 0)) || 0;
-            fOut.totals.assumptions = (fOut.totals.assumptions || []).concat(["caption-first parse"]);
-            fOut.totals.confidence = fOut.totals.confidence ?? 0.95;
-            captionParsed = fOut;
-          }
-        }
-      } catch (captionErr) {
-        console.warn("[/analyze-image-with-text] caption parse error - falling back to vision:", captionErr && (captionErr.message || captionErr));
-        captionParsed = null;
-      }
-    } // end caption parse
-
-    // 3) Always run the vision parser on the image (so we detect items not in caption)
     if (!req.file) {
-      // If no file and captionParsed exists, just return captionParsed (already handled above), else error
-      if (captionParsed) return res.status(200).json(captionParsed);
       return res.status(400).json({ error: "No image file provided." });
     }
 
-    // vision call
+    const captionText = req.body.text || ""; // optional user text
     const imageBase64 = req.file.buffer.toString("base64");
-    const mimeType = req.file.mimetype || "image/jpeg";
-    const userTextBlock = caption ? `${USER_FOOD_IMAGE}\n\nExtra context from user caption: ${caption}` : USER_FOOD_IMAGE;
+    const mimeType = req.file.mimetype;
 
+    // Ask GPT vision model with both inputs
+    const resp = await openai.chat.completions.create({
+      model: OPENAI_MODEL_VISION,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: SYS_FOOD_IMAGE },
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: captionText
+                ? `${USER_FOOD_IMAGE}\n\nExtra context from user: ${captionText}`
+                : USER_FOOD_IMAGE
+            },
+            {
+              type: "image_url",
+              image_url: { url: `data:${mimeType};base64,${imageBase64}` }
+            }
+          ]
+        }
+      ]
+    });
+
+    let out = {};
     try {
-      const vResp = await openai.chat.completions.create({
-        model: OPENAI_MODEL_VISION,
-        temperature: 0.0,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYS_FOOD_IMAGE },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: userTextBlock },
-              { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } }
-            ]
-          }
-        ]
-      });
-
-      visionParsed = safeParse(vResp.choices?.[0]?.message?.content) || null;
-      if (!visionParsed || visionParsed.type !== "food") {
-        visionParsed = { type: "food", details: [], totals: { calories: 0, assumptions: [], confidence: 0 } };
-      }
-    } catch (visionErr) {
-      console.warn("[/analyze-image-with-text] vision parse failed, continuing with caption if any:", visionErr && (visionErr.message || visionErr));
-      visionParsed = { type: "food", details: [], totals: { calories: 0, assumptions: [], confidence: 0 } };
+      out = JSON.parse(resp.choices[0].message.content || "{}");
+    } catch {
+      out = { type: "food", details: [] };
     }
 
-    // Defensive normalize vision details
-    visionParsed.details = Array.isArray(visionParsed.details) ? visionParsed.details.map(d => ({
-      item: (d?.item ?? "").toString(),
+    if (!Array.isArray(out.details)) out.details = [];
+    out.details = out.details.map((d) => ({
+      item: d?.item ?? "",
       quantity: Number(d?.quantity ?? 0) || 0,
       unit: d?.unit ?? "",
       calories: Number(d?.calories ?? 0) || 0,
       macros: {
         protein: Number(d?.macros?.protein ?? 0) || 0,
         fat: Number(d?.macros?.fat ?? 0) || 0,
-        carbs: Number(d?.macros?.carbs ?? 0) || 0
+        carbs: Number(d?.macros?.carbs ?? 0) || 0,
       },
       brand: d?.brand ?? "",
-      source: d?.source ?? "vision",
-      confidence: Math.max(0, Math.min(1, Number(d?.confidence ?? 0))) || 0,
-      assumptions: Array.isArray(d?.assumptions) ? d.assumptions : (d?.assumptions ? [String(d.assumptions)] : [])
-    })) : [];
+      source: d?.source ?? "",
+      confidence: Math.max(0, Math.min(1, Number(d?.confidence ?? 0))) || 0
+    }));
 
-    // 4) Merge captionParsed (preferred) + visionParsed (add unique items)
-    const merged = [];
-    const seen = new Set();
-
-    // Helper to normalize a name for fuzzy matching
-    const normalizeName = (n) => (n || "").toString().toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
-
-    // Add caption items first (if any)
-    if (captionParsed && Array.isArray(captionParsed.details) && captionParsed.details.length) {
-      for (const c of captionParsed.details) {
-        const n = normalizeName(c.item);
-        if (!n) continue;
-        merged.push(c);
-        seen.add(n);
-      }
-    }
-
-    // For each vision item, include only if not covered by caption (fuzzy include)
-    for (const v of visionParsed.details) {
-      const vn = normalizeName(v.item);
-      if (!vn) continue;
-
-      // check for exact or partial overlap with any seen caption names
-      let conflict = false;
-      for (const s of Array.from(seen)) {
-        // if caption name contains vision or vision contains caption (covers "smoothie" vs "banana smoothie")
-        if (s.includes(vn) || vn.includes(s)) {
-          conflict = true;
-          break;
-        }
-        // allow a loose token overlap check: share at least one word
-        const sTokens = s.split(/\s+/).filter(Boolean);
-        const vTokens = vn.split(/\s+/).filter(Boolean);
-        if (sTokens.some(tok => vTokens.includes(tok))) {
-          conflict = true;
-          break;
-        }
-      }
-      if (!conflict) {
-        merged.push(v);
-        seen.add(vn);
-      } else {
-        // If conflict, optionally attach vision assumptions to the caption item (find and merge)
-        for (let i = 0; i < merged.length; i++) {
-          const mName = normalizeName(merged[i].item);
-          if (mName && (mName.includes(vn) || vn.includes(mName) || mName.split(/\s+/).some(tok => vn.split(/\s+/).includes(tok)))) {
-            // append vision assumptions if not duplicate
-            if (Array.isArray(v.assumptions) && v.assumptions.length) {
-              merged[i].assumptions = Array.from(new Set((merged[i].assumptions || []).concat(v.assumptions)));
-            }
-            // optionally, keep a small note about vision confidence
-            merged[i].assumptions = (merged[i].assumptions || []).concat([`vision_conf:${v.confidence || 0}`]);
-            break;
-          }
-        }
-      }
-    }
-
-    // 5) Build totals from merged details (sum calories) and set overall confidence as average
-    let totalCalories = 0;
-    const confs = [];
-    for (const it of merged) {
-      totalCalories += Number(it.calories || 0);
-      if (typeof it.confidence === "number") confs.push(it.confidence);
-      else if (!isNaN(Number(it.confidence))) confs.push(Number(it.confidence));
-    }
-    const overallConfidence = confs.length ? +(confs.reduce((a,b) => a+b, 0)/confs.length).toFixed(3) : null;
-
-    const result = {
-      type: "food",
-      details: merged,
-      totals: {
-        calories: Math.round(totalCalories),
-        assumptions: (captionParsed?.totals?.assumptions || []).concat(visionParsed?.totals?.assumptions || []).filter(Boolean),
-        confidence: overallConfidence
-      }
-    };
-
-    // Defensive: if nothing found, return visionParsed as fallback
-    if (!result.details.length) {
-      return res.status(200).json(visionParsed);
-    }
-
-    console.log("[/analyze-image-with-text] merged items:", result.details.map(d => d.item));
-    return res.status(200).json(result);
-  } catch (err) {
-    console.error("Error in /analyze-image-with-text (merge):", err && (err.stack || err.message || err));
-    return res.status(500).json({ error: "Failed to analyze image with text." });
+    res.status(200).json(out);
+  } catch (error) {
+    console.error("Error in /analyze-image-with-text endpoint:", error);
+    res.status(500).json({ error: "Failed to analyze image with text." });
   }
 });
 
+
+// ---------- LOG ANALYSIS (to Supabase; optionally with image) ----------
+app.post("/log-analysis", upload.fields([{ name: "image" }, { name: "audio" }]), async (req, res) => {
+  try {
+    const { analysisResult, userId, userEmail } = req.body;
+
+    if (!analysisResult || !userId || !userEmail) {
+      return res.status(400).json({
+        error: "analysisResult, userId, and userEmail are required.",
+      });
+    }
+
+    let parsedAnalysis;
+try {
+  parsedAnalysis = typeof analysisResult === "string" ? JSON.parse(analysisResult) : analysisResult;
+} catch {
+  return res.status(400).json({ error: "analysisResult must be valid JSON." });
+}
+
+    const { type = "food", details } = parsedAnalysis;
+    let imageUrl = null;
+
+    if (req.files?.image?.[0]) {
+      const f = req.files.image[0];
+      const fileName = `${Date.now()}-${f.originalname}`;
+      await supabase.storage
+        .from("meal-images")
+        .upload(fileName, f.buffer, { contentType: f.mimetype });
+      const { data: urlData } = supabase.storage
+        .from("meal-images")
+        .getPublicUrl(fileName);
+      imageUrl = urlData.publicUrl;
+    }
+
+    let audioUrl = null;
+
+    if (req.files?.audio?.[0]) {
+      const a = req.files.audio[0];
+      const fileName = `${Date.now()}-${a.originalname}`;
+      await supabase.storage
+        .from("audio-notes") // 👈 use this bucket
+        .upload(fileName, a.buffer, { contentType: a.mimetype || "audio/mpeg" });
+
+      const { data: urlData } = supabase.storage
+        .from("audio-notes")
+        .getPublicUrl(fileName);
+      audioUrl = urlData.publicUrl;
+    }
+
+    
+    let totalCalories = 0;
+let overallConfidence = null;
+
+// FOOD totals: use details (not items), and coerce "250 kcal" → 250
+if (type === "food" && Array.isArray(parsedAnalysis.details)) {
+  totalCalories = parsedAnalysis.details.reduce((sum, it) => {
+    return sum + num(it?.calories, 0);
+  }, 0);
+
+  const vals = parsedAnalysis.details
+    .map(d => (typeof d?.confidence === "number" ? d.confidence : null))
+    .filter(v => v != null);
+
+  overallConfidence = vals.length
+    ? +(vals.reduce((a,b)=>a+b,0) / vals.length).toFixed(3)
+    : null;
+
+// WORKOUT totals: same idea, but from calories_burned
+} else if (type === "workout" && Array.isArray(parsedAnalysis.details)) {
+  totalCalories = parsedAnalysis.details.reduce((sum, d) => {
+    return sum + num(d?.calories_burned, 0);
+  }, 0);
+}
+
+    
+    const evalGemini = parsedAnalysis._eval?.gemini || null;
+    const evalClaude = parsedAnalysis._eval?.claude || null;
+    
+    function averageConfidence(items) {
+      const vals = items
+        .map(it => (it.calorie_estimate && typeof it.calorie_estimate.confidence === "number") ? it.calorie_estimate.confidence : null)
+        .filter(v => v != null);
+      if (!vals.length) return null;
+      return +(vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(3);
+    }
+    
+    const newLog = {
+      user_id: userId,
+      user_email: userEmail,
+      item_type: type,
+      total_calories: Math.round(totalCalories),
+      log_details: parsedAnalysis,
+      image_url: imageUrl,
+      audio_url: audioUrl,
+      ai_confidence: overallConfidence,
+      eval_gemini: evalGemini,
+      eval_claude: evalClaude
+    };
+
+    const { data, error } = await supabase.from("meals").insert([newLog]).select();
+
+    if (error) {
+      console.error("Supabase insert error:", error);
+      throw error;
+    }
+
+    res.status(201).json({
+      message: "Analysis logged successfully!",
+      data: data,
+    });
+  } catch (error) {
+    console.error("Error in /log-analysis endpoint:", error);
+    res.status(500).json({ error: "Failed to log analysis." });
+  }
+});
 
 // ---------- HANDLE CRAVING ----------
 // ---------- HANDLE CRAVING ----------
@@ -2066,6 +1465,212 @@ const totals = {
   }
 });
 
+// -----------------------------
+// triggerExotelCall (replace existing)
+// -----------------------------
+async function triggerExotelCall(opts = {}) {
+  // opts may contain overrides: { from, exophone, sid, flowId, record, apiKey, apiToken, statusCallbackBase }
+  const sid      = opts.sid || process.env.EXOTEL_SID;
+  const apiKey   = opts.apiKey || process.env.EXOTEL_API_KEY;
+  const apiToken = opts.apiToken || process.env.EXOTEL_API_TOKEN;
+  const exophone = opts.exophone || process.env.EXOPHONE;
+  const from     = opts.from || process.env.MY_PHONE;
+  const flowId   = opts.flowId || process.env.EXOTEL_FLOW_ID || "1065544";
+  const baseUrl  = (opts.statusCallbackBase || process.env.BASE_URL || `http://localhost:${port}`).replace(/\/$/, "");
+
+  if (!sid || !apiKey || !apiToken || !exophone || !from) {
+    const missing = [];
+    if (!sid) missing.push("EXOTEL_SID");
+    if (!apiKey) missing.push("EXOTEL_API_KEY");
+    if (!apiToken) missing.push("EXOTEL_API_TOKEN");
+    if (!exophone) missing.push("EXOPHONE");
+    if (!from) missing.push("MY_PHONE");
+    const err = new Error("Missing Exotel credentials/env: " + missing.join(", "));
+    console.error(err.message);
+    throw err;
+  }
+
+  try {
+    console.log("Manual trigger received, calling triggerExotelCall()");
+
+    // Exotel connect endpoint (use axios auth rather than embedding credentials in URL)
+    const url = `https://api.exotel.com/v1/Accounts/${sid}/Calls/connect`;
+
+    // Build form body. Keep Record:false for Passthru approach so the <Record> returned by start-recording runs.
+    const payload = new URLSearchParams({
+      From: from,
+      CallerId: exophone,
+      Url: `http://my.exotel.com/${sid}/exoml/start_voice/${flowId}`,
+      StatusCallback: `${baseUrl}/exotel-callback`,
+      Record: "true"
+    });
+
+    const response = await axios.post(url, payload.toString(), {
+      auth: { username: apiKey, password: apiToken },
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 30000
+    });
+
+    console.log("Exotel Call Triggered:", response.data);
+    return { ok: true, status: response.status, data: response.data };
+  } catch (err) {
+    const respBody = err?.response?.data || err?.message;
+    console.error("Error triggering Exotel call:", respBody);
+    const error = new Error("Exotel trigger failed");
+    error.details = respBody;
+    error.status = err?.response?.status || 500;
+    throw error;
+  }
+}
+
+
+
+// -----------------------------
+// /simulate-trigger route that calls triggerExotelCall()
+// -----------------------------
+app.post("/simulate-trigger", express.json(), async (req, res) => {
+  try {
+    // Optional overrides from body or query
+    const overrides = {
+      from: req.body?.from || req.query?.from,
+      exophone: req.body?.exophone || req.query?.exophone,
+      sid: req.body?.sid || req.query?.sid,
+      flowId: req.body?.flowId || req.query?.flowId,
+      record: (req.body?.record === true) || (req.query?.record === "true"),
+      apiKey: req.body?.apiKey || req.query?.apiKey,
+      apiToken: req.body?.apiToken || req.query?.apiToken,
+      statusCallbackBase: req.body?.statusCallbackBase || req.query?.statusCallbackBase
+    };
+
+    // Call the trigger function (this will perform the actual Exotel API POST)
+    const result = await triggerExotelCall(overrides);
+
+    return res.status(200).json({
+      ok: true,
+      message: "triggerExotelCall executed",
+      result
+    });
+  } catch (err) {
+    console.error("simulate-trigger error:", err.details ?? err.message);
+    return res.status(err.status || 500).json({
+      ok: false,
+      message: "Failed to trigger Exotel call",
+      error: err.details || err.message
+    });
+  }
+});
+
+// -------------------
+// /start-recording route — returns ExoML (TwiML-like) telling Exotel to record
+// -------------------
+app.all("/start-recording", (req, res) => {
+  console.log("PASSTHRU -> /start-recording called:", {
+    method: req.method,
+    query: req.query,
+    body: req.body,
+  });
+
+  // Public callback endpoint (must be your ngrok/BASE_URL)
+  const callbackUrl = `${process.env.BASE_URL.replace(/\/$/, "")}/exotel-callback`;
+  console.log("callbackUrl", callbackUrl);
+  // Exotel interprets this XML (similar to Twilio TwiML)
+  // <Record> will:
+  //  - play a beep
+  //  - record up to 120s
+  //  - stop on "#"
+  //  - POST the file info to /exotel-callback
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="female">Please tell me your food and workout after the beep. Press hash when finished.</Say>
+  <Record playBeep="true" maxLength="120" finishOnKey="#" action="${callbackUrl}" method="POST" />
+  <Say>We did not receive any recording. Goodbye.</Say>
+</Response>`;
+
+  res.set("Content-Type", "text/xml");
+  res.status(200).send(xml);
+});
+
+// -------------------
+// /exotel-callback route — receives Exotel's POST and forwards recording to analyze endpoint
+// Uses uploadNone (multer().none()) to parse multipart/form-data fields reliably
+// -------------------
+app.post("/exotel-callback", uploadNone, async (req, res) => {
+  try {
+    // multer.none() (uploadNone) or urlencoded parser will have populated req.body
+    console.log("🔔 /exotel-callback fields:", req.body);
+    console.log("🔔 /exotel-callback fields:", JSON.stringify(req.body || {}, null, 2));
+console.log("🔔 keys:", Object.keys(req.body || {}));
+
+
+    const fields = req.body || {};
+
+    // Try common keys Exotel may use
+    const RecordingUrl =
+      fields.RecordingUrl ||
+      fields.recording_url ||
+      fields.recordingUrl ||
+      (Array.isArray(fields.RecordingUrl) && fields.RecordingUrl[0]) ||
+      null;
+
+    const Status = fields.Status || fields.status || fields.CallStatus || null;
+
+    // ACK quickly so Exotel won't retry
+    res.sendStatus(200);
+
+    if (!RecordingUrl) {
+      console.warn("No RecordingUrl in callback — fields were:", fields);
+      return;
+    }
+
+    console.log("✅ Got RecordingUrl:", RecordingUrl, "Status:", Status, " — downloading...");
+
+    // Download the recording
+    let audioResp;
+    try {
+      audioResp = await axios.get(RecordingUrl, { responseType: "arraybuffer", timeout: 60000 });
+    } catch (err) {
+      console.error("Failed to download recording URL:", err.message || err);
+      return;
+    }
+
+    if (audioResp.status !== 200) {
+      console.error("Non-200 when downloading recording:", audioResp.status);
+      return;
+    }
+
+    const audioBuffer = Buffer.from(audioResp.data);
+
+    // forward as multipart/form-data to analyze-audio
+    const form = new FormData();
+    form.append("audio", audioBuffer, {
+      filename: "exotel_recording.mp3",
+      contentType: audioResp.headers["content-type"] || "audio/mpeg",
+    });
+
+    console.log("Forwarding recording to /analyze-audio...");
+    try {
+      const forwardResp = await axios.post(`${process.env.BASE_URL.replace(/\/$/, "")}/analyze-audio`, form, {
+        headers: form.getHeaders(),
+        timeout: 120000,
+      });
+      console.log("analyze-audio response status:", forwardResp.status);
+    } catch (err) {
+      console.error("Error forwarding to analyze-audio:", (err.response && err.response.data) || err.message);
+    }
+
+  } catch (err) {
+    console.error("Unexpected error in /exotel-callback:", err);
+    try { res.sendStatus(500); } catch (e) {}
+  }
+});
+
+
+// -------------------- SCHEDULER --------------------
+// Runs every day at 9PM IST
+cron.schedule("0 21 * * *", () => {
+  console.log("9PM reached → Triggering Exotel call...");
+  triggerExotelCall();
+});
 // =========================
 // 5. SPOONACULAR API HELPERS (SECONDARY)
 // =========================
